@@ -1,0 +1,321 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Watch Together — local movie nights</title>
+  <!-- Requested CDN setup. Compile Tailwind to static CSS for a hardened production deployment. -->
+  <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+  <style>
+    body{margin:0;background:#09090b;color:#e4e4e7;font-family:system-ui,sans-serif}
+    [hidden]{display:none!important}button,input{font:inherit}button{cursor:pointer}
+    button:disabled{opacity:.4;cursor:not-allowed}input[type=range]{accent-color:#8b5cf6}
+    :focus-visible{outline:2px solid #a78bfa;outline-offset:4px}
+    #canvas:fullscreen{display:flex;flex-direction:column;background:#000}
+    #canvas:fullscreen #screen{flex:1;aspect-ratio:auto}
+    #messages{scrollbar-width:thin;overflow-wrap:anywhere}
+    .field{width:100%;border:1px solid #3f3f46;border-radius:12px;background:#18181b;padding:12px;color:#fafafa}
+    .primary{background:#7c3aed;color:white;border-radius:12px;padding:12px 20px;font-weight:600}
+    .secondary{border:1px solid #3f3f46;background:#27272a;border-radius:12px;padding:10px 16px}
+  </style>
+</head>
+<body class="min-h-screen">
+  <header class="border-b border-zinc-800 px-5 py-5 lg:px-10 flex items-center justify-between gap-4">
+    <a href="/" class="font-bold text-xl tracking-tight"> <span class="text-violet-400">▶</span> Watch Together</a>
+    <span id="connection" role="status" class="text-xs text-zinc-400">Connecting…</span>
+  </header>
+  <main class="mx-auto max-w-[1600px] p-5 lg:p-10">
+    <section id="lobby" class="max-w-xl mx-auto py-12 lg:py-20">
+      <p class="text-violet-400 text-sm font-semibold tracking-widest uppercase mb-4">Different houses. Same movie.</p>
+      <h1 class="text-4xl lg:text-5xl font-bold tracking-tight mb-5">Your movie night,<br>together.</h1>
+      <p class="text-zinc-400 leading-relaxed mb-8">Select your own copy of the same MP4. We keep playback in sync while you chat. Your video stays on your device.</p>
+      <div class="rounded-2xl border border-zinc-800 bg-zinc-900 p-6 space-y-5">
+        <label class="block text-sm">Your display name<input id="name" class="field mt-2" maxlength="32" placeholder="Your name" autocomplete="nickname"></label>
+        <button id="create" class="primary w-full" disabled>Create Room</button>
+        <div class="flex items-center gap-3 text-xs text-zinc-500"><hr class="flex-1 border-zinc-700">OR JOIN A FRIEND<hr class="flex-1 border-zinc-700"></div>
+        <form id="joinForm" class="flex gap-2"><input id="roomInput" aria-label="Room ID" class="field min-w-0 uppercase" maxlength="18" placeholder="Room ID" required><button id="join" class="secondary" disabled>Join</button></form>
+      </div>
+      <p class="text-xs text-zinc-500 mt-6">No ads. No app session timer. Each person needs the same file and a browser that supports its video and audio codecs.</p>
+    </section>
+    <section id="room" hidden>
+      <div class="flex items-center justify-between gap-4 mb-6"><div><h1 class="text-xl font-semibold">Movie room <span id="roomCode" class="text-violet-400 font-mono text-sm"></span></h1><p id="role" class="text-sm text-zinc-400 mt-1"></p></div><button id="leave" class="secondary">Leave room</button></div>
+      <div class="grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_340px] gap-6 items-start">
+        <section class="min-w-0">
+          <div id="canvas" class="rounded-2xl overflow-hidden border border-zinc-800 bg-black">
+            <div id="screen" class="relative aspect-video">
+              <!-- Object URLs reference local bytes. This element never points at the server. -->
+              <video id="video" class="w-full h-full object-contain" playsinline preload="auto" disablepictureinpicture></video>
+              <button id="drop" class="absolute inset-0 flex flex-col items-center justify-center gap-4 bg-zinc-950 text-center p-5">
+                <span class="rounded-2xl bg-violet-500/10 text-violet-400 text-4xl p-5">＋</span>
+                <span class="font-semibold text-lg">Drag &amp; Drop or Click to Select MP4 File</span>
+                <span class="text-sm text-zinc-500">Local playback · Nothing uploaded</span>
+              </button>
+              <button id="unlock" hidden class="absolute inset-0 bg-black/75 flex items-center justify-center"><span class="primary">Click to enable playback</span></button>
+            </div>
+            <div class="bg-zinc-900 p-4 space-y-3">
+              <input id="seek" type="range" min="0" max="1" step="0.1" value="0" class="w-full" aria-label="Playback position" disabled>
+              <div class="flex items-center justify-between gap-3 flex-wrap">
+                <div class="flex items-center gap-3"><button id="play" class="primary !py-2" disabled>Play</button><span id="time" class="text-xs text-zinc-400 tabular-nums">0:00 / 0:00</span></div>
+                <div class="flex items-center gap-3"><label class="text-xs flex items-center gap-2">Volume<input id="volume" type="range" min="0" max="1" step="0.05" value="1" class="w-20"></label><button id="fullscreen" class="secondary !py-2" aria-label="Toggle fullscreen">⛶</button></div>
+              </div>
+            </div>
+          </div>
+          <div class="flex items-center justify-between gap-3 mt-4"><p id="filename" class="text-sm text-zinc-400 truncate">No video selected</p><button id="change" class="secondary text-sm shrink-0">Select file</button></div>
+          <p id="playbackStatus" class="text-sm text-violet-300 mt-4" role="status">Waiting for the host to choose a video.</p>
+          <p class="text-xs text-zinc-500 mt-3">The host controls play, pause and seeking. Playback waits while someone loads or buffers. Volume is personal.</p>
+          <input id="file" hidden type="file" accept=".mp4,video/mp4">
+        </section>
+        <aside class="rounded-2xl border border-zinc-800 bg-zinc-900 flex flex-col h-[640px] max-h-[85vh]">
+          <div class="p-5 border-b border-zinc-800"><button id="invite" class="primary w-full">Copy Room Invite Link</button></div>
+          <div class="p-5 border-b border-zinc-800"><h2 class="font-semibold text-sm mb-3">Watching together <span id="count" class="text-zinc-500"></span></h2><ul id="users" class="space-y-2 text-sm max-h-36 overflow-auto"></ul></div>
+          <h2 class="px-5 pt-4 font-semibold text-sm">Room chat</h2>
+          <div id="messages" class="flex-1 min-h-0 overflow-y-auto p-5 space-y-4" role="log" aria-label="Room chat" aria-live="polite"></div>
+          <form id="chatForm" class="p-4 border-t border-zinc-800 flex gap-2"><input id="chatInput" class="field min-w-0" placeholder="Message your friends…" maxlength="1000" aria-label="Chat message" required><button id="send" class="primary !px-4">Send</button></form>
+        </aside>
+      </div>
+    </section>
+    <p id="notice" role="status" class="text-sm text-amber-300 mt-5 text-center"></p>
+  </main>
+  <script src="/socket.io/socket.io.js"></script>
+  <script>
+  'use strict';
+  // Relative origin automatically uses the deployed Render domain and HTTPS.
+  const socket = io();
+  const $ = id => document.getElementById(id);
+  const video = $('video');
+  let roomId = '', hostId = '', state = null, localMedia = null, objectURL = null;
+  let myReady = false, buffering = false, clockOffset = 0, bestRTT = Infinity;
+  let scrubbing = false, loadingFile = false, loadGeneration = 0, playbackAttempt = 0, needsUnlock = false;
+  const seenMessages = new Set();
+  const isHost = () => socket.id === hostId;
+  const notice = text => { $('notice').textContent = text; };
+  const format = n => {
+    n = Math.max(0, Math.floor(Number.isFinite(n) ? n : 0));
+    return n >= 3600 ? `${Math.floor(n/3600)}:${String(Math.floor(n/60)%60).padStart(2,'0')}:${String(n%60).padStart(2,'0')}` : `${Math.floor(n/60)}:${String(n%60).padStart(2,'0')}`;
+  };
+  // All requests use ACK timeouts. Offline actions are never queued for later replay.
+  function request(event, payload) {
+    return new Promise((resolve, reject) => {
+      if (!socket.connected) return reject(new Error('Disconnected. Wait for reconnection.'));
+      const cb = (err, result) => {
+        if (err) reject(new Error('Server did not respond. Please try again.'));
+        else if (result?.error) reject(new Error(result.error));
+        else resolve(result);
+      };
+      if (event === 'sync' || event === 'clock' || event === 'leave') socket.timeout(8000).emit(event, cb);
+      else socket.timeout(8000).emit(event, payload, cb);
+    });
+  }
+  function controls() {
+    const enabled = Boolean(roomId && socket.connected && isHost() && myReady && localMedia);
+    $('play').disabled = $('seek').disabled = !enabled;
+    $('send').disabled = !socket.connected;
+    $('role').textContent = isHost() ? 'You are the host · You control playback' : 'The host controls playback';
+    $('play').textContent = state?.desired ? 'Pause' : 'Play';
+  }
+  function status() {
+    let text = 'Waiting for the host to choose a video.';
+    if (state?.media) {
+      if (!localMedia) text = `Select your local copy of “${state.media.name}”.`;
+      else if (!myReady) text = 'File does not match the host’s size/duration. Select the same MP4.';
+      else if (!socket.connected) text = 'Connection lost. Playback paused while reconnecting.';
+      else if (state.blocked) text = 'Waiting for everyone to load their file or finish buffering…';
+      else text = state.playing ? 'Playing together · Synced' : 'Paused · Synced';
+    }
+    $('playbackStatus').textContent = text;
+    controls();
+  }
+  // Server timestamps plus measured clock offset compensate for transit time.
+  function targetTime() {
+    if (!state) return 0;
+    return Math.max(0, Math.min(localMedia?.duration || 0,
+      state.time + (state.playing ? Math.max(0, Date.now() + clockOffset - state.at) / 1000 : 0)));
+  }
+  async function applyPlayback(force = false) {
+    if (!state || !localMedia || loadingFile || !myReady || !socket.connected) { video.pause(); return; }
+    const target = targetTime();
+    // Never emit control commands from video DOM events: remote updates cannot echo.
+    if (!video.seeking && Math.abs(video.currentTime - target) > (force ? 0.15 : 0.65)) video.currentTime = target;
+    if (!state.playing) { video.pause(); $('unlock').hidden = !needsUnlock; }
+    else if (video.paused) {
+      const attempt = ++playbackAttempt;
+      try { await video.play(); $('unlock').hidden = true; }
+      catch (error) {
+        if (attempt !== playbackAttempt || !state?.playing) return;
+        if (error.name === 'NotAllowedError') { needsUnlock = true; $('unlock').hidden = false; reportBuffer(true); }
+        else if (error.name !== 'AbortError') notice('Playback failed. Check the MP4’s video/audio codecs.');
+      }
+    }
+    status();
+  }
+  function acceptState(next, force = false) {
+    if (!next || (state && next.revision < state.revision)) return;
+    state = next; hostId = next.hostId;
+    myReady = Boolean(localMedia && next.media && localMedia.size === next.media.size && Math.abs(localMedia.duration-next.media.duration) < 0.25);
+    status(); applyPlayback(force);
+  }
+  function appendMessage(message) {
+    if (!message || seenMessages.has(message.id)) return;
+    seenMessages.add(message.id);
+    const item = document.createElement('div');
+    const heading = document.createElement('p'); heading.className = 'text-xs text-violet-300 mb-1';
+    heading.textContent = `${message.name} · ${new Date(message.at).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})}`;
+    const body = document.createElement('p'); body.className = 'text-sm text-zinc-300 whitespace-pre-wrap';
+    body.textContent = message.text; // Untrusted chat is text, never HTML.
+    item.append(heading, body); $('messages').append(item);
+    while ($('messages').children.length > 100) $('messages').firstChild.remove();
+    // Bound the deduplication cache too.
+    if (seenMessages.size > 200) seenMessages.delete(seenMessages.values().next().value);
+    $('messages').scrollTop = $('messages').scrollHeight;
+  }
+  async function enter(create = false, reconnect = false) {
+    $('create').disabled = $('join').disabled = true;
+    try {
+      const result = await request('enter', { create, roomId: reconnect ? roomId : $('roomInput').value.trim(), name: $('name').value.trim() });
+      roomId = result.roomId; state = null; hostId = result.state.hostId;
+      $('roomCode').textContent = roomId; $('lobby').hidden = true; $('room').hidden = false;
+      const url = new URL(location.href); url.searchParams.set('room', roomId); history.replaceState(null, '', url);
+      $('messages').replaceChildren(); seenMessages.clear(); result.chat.forEach(appendMessage);
+      acceptState(result.state, true); notice('');
+      if (localMedia) {
+        await request('media', localMedia); buffering = false;
+        if (video.readyState < 3) reportBuffer(true);
+      }
+    } catch (e) {
+      notice(e.message);
+      if (reconnect) resetRoom();
+    } finally { $('create').disabled = $('join').disabled = !socket.connected; }
+  }
+  function resetRoom() {
+    roomId = ''; hostId = ''; state = null; myReady = false; video.pause();
+    $('lobby').hidden = false; $('room').hidden = true; $('unlock').hidden = true;
+    const url = new URL(location.href); url.searchParams.delete('room'); history.replaceState(null, '', url);
+  }
+  async function measureClock() {
+    const start = Date.now();
+    try {
+      const serverTime = await request('clock'); const end = Date.now();
+      if (end-start <= bestRTT) { bestRTT = end-start; clockOffset = serverTime-(start+end)/2; }
+    } catch {} // Connection indicator already exposes transport failures.
+  }
+  socket.on('connect', async () => {
+    $('connection').textContent = '● Connected'; $('create').disabled = $('join').disabled = false;
+    bestRTT = Infinity; await measureClock();
+    if (roomId) await enter(false, true);
+    controls();
+  });
+  socket.on('disconnect', () => { video.pause(); $('connection').textContent = '● Reconnecting…'; $('create').disabled = $('join').disabled = true; status(); });
+  socket.on('connect_error', () => { $('connection').textContent = 'Unable to connect · Retrying…'; });
+  socket.on('state', next => acceptState(next, true));
+  socket.on('chat', appendMessage);
+  socket.on('users', data => {
+    hostId = data.hostId; $('users').replaceChildren(); $('count').textContent = `(${data.users.length})`;
+    for (const u of data.users) {
+      const li = document.createElement('li'); li.className = 'flex justify-between gap-2';
+      const name = document.createElement('span'); name.className = 'truncate'; name.textContent = `${u.name}${u.id===socket.id?' (you)':''}${u.id===hostId?' · Host':''}`;
+      const badge = document.createElement('span'); badge.className = 'text-xs text-zinc-400 shrink-0'; badge.textContent = u.buffering ? 'Buffering' : u.ready ? 'Ready' : 'Needs file';
+      li.append(name,badge); $('users').append(li);
+    }
+    status();
+  });
+  $('create').onclick = () => enter(true);
+  $('joinForm').onsubmit = event => { event.preventDefault(); enter(); };
+  $('leave').onclick = async () => { try { await request('leave'); resetRoom(); } catch(e) { notice(e.message); } };
+  $('invite').onclick = async () => {
+    try { await navigator.clipboard.writeText(location.href); notice('Invite link copied.'); }
+    catch { notice(`Copy this invite link: ${location.href}`); }
+  };
+  $('chatForm').onsubmit = async event => {
+    event.preventDefault(); const text = $('chatInput').value.trim(); if (!text) return;
+    $('send').disabled = true;
+    try { const result = await request('chat', text); appendMessage(result.message); $('chatInput').value = ''; }
+    catch(e) { notice(e.message); } finally { $('send').disabled = !socket.connected; }
+  };
+  async function command(action, time = video.currentTime) {
+    if (!isHost() || !myReady) return;
+    try { const result = await request('control', {action,time}); acceptState(result.state, true); }
+    catch(e) { notice(e.message); }
+  }
+  $('play').onclick = () => {
+    // Unlock host audio while the click still has transient browser activation.
+    if (!state?.desired) video.play().catch(() => {});
+    command(state?.desired ? 'pause' : 'play');
+  };
+  $('seek').oninput = () => { scrubbing = true; $('time').textContent = `${format(Number($('seek').value))} / ${format(video.duration)}`; };
+  $('seek').onchange = () => { scrubbing = false; command('seek', Number($('seek').value)); };
+  $('volume').oninput = () => { video.volume = Number($('volume').value); };
+  $('fullscreen').onclick = async () => {
+    try { if(document.fullscreenElement) await document.exitFullscreen(); else await $('canvas').requestFullscreen(); }
+    catch { notice('Fullscreen is unavailable in this browser.'); }
+  };
+  $('unlock').onclick = async () => {
+    try { await video.play(); needsUnlock = false; $('unlock').hidden = true; reportBuffer(false); }
+    catch { notice('Playback could not start. Check the MP4 codec.'); }
+  };
+  video.addEventListener('timeupdate', () => {
+    if (!scrubbing) { $('seek').value = video.currentTime; $('time').textContent = `${format(video.currentTime)} / ${format(video.duration)}`; }
+  });
+  video.addEventListener('ended', () => { if (isHost()) command('pause', video.duration); });
+  function reportBuffer(value) {
+    if (loadingFile || !myReady || !socket.connected || buffering === value) return;
+    buffering = value; socket.emit('buffer', value);
+  }
+  video.addEventListener('waiting', () => reportBuffer(true));
+  video.addEventListener('canplay', () => reportBuffer(false));
+  video.addEventListener('playing', () => reportBuffer(false));
+  video.addEventListener('error', () => {
+    if (loadingFile) return;
+    localMedia = null; myReady = false; video.pause(); $('drop').hidden = false;
+    if(socket.connected && roomId) request('media', null).catch(e => notice(e.message));
+    notice('This MP4 could not be decoded. Try a browser-compatible H.264/AAC MP4.'); controls();
+  });
+  // File selection uses a local blob URL. Neither file bytes nor paths leave the browser.
+  async function loadFile(file) {
+    if (!file || !/\.mp4$/i.test(file.name)) return notice('Please select an MP4 file.');
+    if (!roomId || !socket.connected) return notice('Join a connected room before selecting a file.');
+    const generation = ++loadGeneration;
+    loadingFile = true; needsUnlock = false; $('unlock').hidden = true; localMedia = null; myReady = false; buffering = false; video.pause(); controls();
+    try {
+      await request('media', null);
+      if (objectURL) URL.revokeObjectURL(objectURL);
+      objectURL = URL.createObjectURL(file);
+      // Install listeners BEFORE setting src; metadata can be loaded immediately.
+      await new Promise((resolve,reject) => {
+        const timer = setTimeout(() => finish(new Error('Could not read video metadata.')), 15000);
+        const ok = () => finish(); const bad = () => finish(new Error('Unsupported or damaged MP4.'));
+        function finish(error) { clearTimeout(timer); video.removeEventListener('loadedmetadata',ok); video.removeEventListener('error',bad); error ? reject(error) : resolve(); }
+        video.addEventListener('loadedmetadata',ok); video.addEventListener('error',bad);
+        video.src = objectURL; video.load();
+      });
+      if (generation !== loadGeneration) return;
+      if (!Number.isFinite(video.duration) || video.duration <= 0) throw new Error('This file has no valid duration.');
+      localMedia = { name:file.name, size:file.size, duration:video.duration };
+      $('filename').textContent = file.name; $('seek').max = video.duration; $('drop').hidden = true;
+      loadingFile = false;
+      const result = await request('media',localMedia); myReady = result.ready;
+      buffering = false;
+      if (video.readyState < 3) reportBuffer(true);
+      await applyPlayback(true); status(); notice('');
+    } catch(e) { localMedia = null; myReady = false; $('drop').hidden = false; notice(e.message); }
+    finally { loadingFile = false; $('file').value = ''; controls(); }
+  }
+  $('file').onchange = () => loadFile($('file').files[0]);
+  $('drop').onclick = $('change').onclick = () => { if (!loadingFile) $('file').click(); };
+  $('screen').addEventListener('dragover', event => { event.preventDefault(); });
+  $('screen').addEventListener('drop', event => { event.preventDefault(); if (!loadingFile) loadFile(event.dataTransfer.files[0]); });
+  // Resync every 3 seconds while a party is open. No background requests without a room.
+  setInterval(async () => {
+    if (!roomId || !socket.connected || loadingFile) return;
+    try { const result = await request('sync'); acceptState(result.state); }
+    catch(e) { notice(e.message); }
+    if (buffering && video.readyState >= 3) reportBuffer(false);
+  }, 3000);
+  setInterval(() => { if (roomId && socket.connected) { bestRTT = Infinity; measureClock(); } }, 30000);
+  document.addEventListener('visibilitychange', () => { if (!document.hidden && roomId && socket.connected) request('sync').then(r=>acceptState(r.state,true)).catch(e=>notice(e.message)); });
+  window.addEventListener('beforeunload', () => { if(objectURL) URL.revokeObjectURL(objectURL); });
+  // Invite links pre-fill the lobby; joining still requires an explicit user action.
+  $('roomInput').value = new URLSearchParams(location.search).get('room') || '';
+  </script>
+</body>
+</html>
