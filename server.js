@@ -1,11 +1,34 @@
 'use strict';
 
-// One Node process owns all ephemeral rooms. No upload routes or media storage.
+// One Node process owns ephemeral rooms and temporary MP4 uploads.
 const express = require('express');
 const http = require('node:http');
 const path = require('node:path');
 const { randomBytes, randomUUID } = require('node:crypto');
 const { Server } = require('socket.io');
+const fs = require('node:fs');
+const fsp = require('node:fs/promises');
+const os = require('node:os');
+const { Transform } = require('node:stream');
+const { pipeline } = require('node:stream/promises');
+// A private per-process directory avoids exposing uploads through static assets.
+const uploadDir = fs.mkdtempSync(path.join(os.tmpdir(), 'watch-party-'));
+const MAX_FILE = 1024 * 1024 * 1024; // 1 GiB per MP4; bounded for hobby hosting.
+const MAX_STORAGE = 2 * MAX_FILE; // Global budget includes in-flight reservations.
+let reservedBytes = 0;
+const uploads = new Map();
+function releaseUpload(upload) {
+  if (!upload || upload.released) return;
+  upload.released = true; reservedBytes -= upload.size;
+  uploads.delete(upload.token); clearTimeout(upload.timer);
+  upload.abort?.();
+  fsp.rm(upload.path, { force: true }).catch(() => {});
+}
+function releaseMedia(media) {
+  if (!media || media.released) return;
+  media.released = true; reservedBytes -= media.size;
+  fsp.rm(media.path, { force: true }).catch(() => {});
+}
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
@@ -37,7 +60,9 @@ const channel = id => `party:${id}`;
 const roomFor = socket => rooms.get(socket.data.roomId);
 const position = room => Math.min(room.media?.duration || 0,
   room.state.time + (room.state.playing ? (Date.now() - room.state.at) / 1000 : 0));
-const snapshot = room => ({ ...room.state, time: position(room), at: Date.now(), media: room.media, hostId: room.hostId });
+// Never publish filesystem paths or write credentials.
+const snapshot = room => ({ ...room.state, time: position(room), at: Date.now(),
+  media: room.media ? { name: room.media.name, size: room.media.size, duration: room.media.duration, key: room.media.key, url: `/media/${room.id}/${room.media.key}` } : null, hostId: room.hostId });
 const publishUsers = room => io.to(channel(room.id)).emit('users', {
   hostId: room.hostId,
   users: [...room.users.values()].map(u => ({ id: u.id, name: u.name, ready: u.ready, buffering: u.buffering }))
@@ -48,19 +73,16 @@ function revise(room, time = position(room)) {
   room.state = { time, desired: room.state.desired, playing: room.state.desired && !blocked,
     blocked, at: Date.now(), revision: room.state.revision + 1 };
 }
-function compatible(a, b) {
-  // Metadata is a sanity check, not proof of byte-identical files.
-  return a && b && a.size === b.size && Math.abs(a.duration - b.duration) < 0.25;
-}
 function leave(socket) {
   const room = roomFor(socket);
   if (!room) return;
   room.users.delete(socket.id);
   socket.leave(channel(room.id));
   delete socket.data.roomId;
-  if (!room.users.size) { rooms.delete(room.id); return; }
+  if (!room.users.size) { releaseUpload(room.upload); releaseMedia(room.media); rooms.delete(room.id); return; }
   if (room.hostId === socket.id) {
-    // Prefer a participant with a matching file when transferring control.
+    releaseUpload(room.upload); room.upload = null;
+    // Prefer someone whose shared video is already ready.
     room.hostId = [...room.users.values()].find(u => u.ready)?.id || room.users.keys().next().value;
   }
   revise(room);
@@ -109,27 +131,32 @@ io.on('connection', socket => {
     publishUsers(room);
     socket.to(channel(room.id)).emit('state', snapshot(room));
   });
-  socket.on('media', (input, ack) => {
+  socket.on('upload-start', (input, ack) => {
     const room = roomFor(socket);
-    if (!room || !permit('media', 4, 1)) return reply(ack, { error: 'Cannot update file right now.' });
-    const u = room.users.get(socket.id);
-    if (input === null) { u.media = null; u.ready = false; u.buffering = false; }
-    else {
-      if (!input || !Number.isSafeInteger(input.size) || input.size <= 0 || !finite(input.duration) || input.duration <= 0 || input.duration > 604800)
-        return reply(ack, { error: 'Invalid video metadata.' });
-      u.media = { name: clean(input.name, 180), size: input.size, duration: input.duration };
-      u.buffering = false;
-      if (room.hostId === socket.id) {
-        const changed = !compatible(room.media, u.media);
-        room.media = u.media;
-        if (changed) { room.state.desired = false; room.state.time = 0; room.state.playing = false; }
-        for (const member of room.users.values()) member.ready = compatible(room.media, member.media);
-      } else u.ready = compatible(room.media, u.media);
-    }
-    revise(room);
-    publishUsers(room);
+    if (!room || socket.id !== room.hostId || !permit('upload', 2, 0.1))
+      return reply(ack, { error: 'Only the host can upload. Please wait between uploads.' });
+    if (room.upload && !room.upload.released) return reply(ack, { error: 'An upload is already in progress.' });
+    if (!input || !Number.isSafeInteger(input.size) || input.size <= 0 || input.size > MAX_FILE ||
+        !finite(input.duration) || input.duration <= 0 || input.duration > 604800 || !/\.mp4$/i.test(input.name || ''))
+      return reply(ack, { error: 'Choose a valid MP4 no larger than 1 GiB.' });
+    if (reservedBytes + input.size > MAX_STORAGE) return reply(ack, { error: 'Temporary video storage is full. Try after another room closes.' });
+    const token = randomBytes(32).toString('hex');
+    const upload = { token, roomId: room.id, hostId: socket.id, name: clean(input.name, 180),
+      duration: input.duration, size: input.size, path: path.join(uploadDir, token + '.mp4'), started: false };
+    reservedBytes += upload.size; room.upload = upload; uploads.set(token, upload);
+    upload.timer = setTimeout(() => releaseUpload(upload), 30 * 60 * 1000);
+    upload.timer.unref();
+    reply(ack, { url: `/upload/${token}`, maxBytes: MAX_FILE });
+  });
+  socket.on('ready', (input, ack) => {
+    const room = roomFor(socket);
+    if (!room || !permit('ready', 10, 3) || !input || typeof input.ready !== 'boolean' || input.key !== room.media?.key)
+      return reply(ack, { error: 'Video has changed. Reload the shared video.' });
+    const member = room.users.get(socket.id);
+    member.ready = input.ready; member.buffering = false;
+    revise(room); publishUsers(room);
     io.to(channel(room.id)).emit('state', snapshot(room));
-    reply(ack, { ok: true, ready: u.ready });
+    reply(ack, { ok: true });
   });
   socket.on('control', (input, ack) => {
     const room = roomFor(socket);
@@ -174,6 +201,65 @@ io.on('connection', socket => {
   socket.on('disconnect', () => leave(socket));
 });
 
-server.listen(process.env.PORT || 3000, '0.0.0.0', () => console.log('Watch Together signaling server ready'));
-// Render restarts erase rooms. Clients report this instead of silently creating unrelated rooms.
-process.on('SIGTERM', () => { io.close(); server.close(() => process.exit(0)); });
+// Raw-body uploads are piped to disk with backpressure; no full-video RAM buffer.
+app.put('/upload/:token', async (req, res) => {
+  const upload = uploads.get(req.params.token);
+  const room = upload && rooms.get(upload.roomId);
+  if (!upload || upload.started || upload.released || !room || room.hostId !== upload.hostId)
+    return res.status(403).json({ error: 'Upload expired or not authorized.' });
+  if (req.headers['content-type'] !== 'video/mp4' || Number(req.headers['content-length']) !== upload.size) {
+    releaseUpload(upload);
+    return res.status(400).json({ error: 'Upload must contain the selected MP4 bytes.' });
+  }
+  upload.started = true;
+  const controller = new AbortController();
+  upload.abort = () => controller.abort();
+  req.setTimeout(60000, () => controller.abort());
+  let received = 0;
+  const limit = new Transform({ transform(chunk, encoding, callback) {
+    received += chunk.length;
+    if (received > upload.size) callback(new Error('File too large.'));
+    else callback(null, chunk);
+  }});
+  try {
+    await pipeline(req, limit, fs.createWriteStream(upload.path, { flags: 'wx' }), { signal: controller.signal });
+    if (received !== upload.size || rooms.get(room.id) !== room || room.hostId !== upload.hostId || upload.released)
+      throw new Error('Upload interrupted or room closed.');
+    const handle = await fsp.open(upload.path, 'r');
+    const header = Buffer.alloc(12);
+    try { await handle.read(header, 0, 12, 0); } finally { await handle.close(); }
+    if (header.toString('ascii', 4, 8) !== 'ftyp') throw new Error('This file is not an MP4 container.');
+    releaseMedia(room.media);
+    // Move the reservation from an upload into the active video without double-counting.
+    clearTimeout(upload.timer); uploads.delete(upload.token); upload.released = true; upload.abort = null;
+    room.upload = null;
+    room.media = { name: upload.name, size: upload.size, duration: upload.duration,
+      key: randomBytes(24).toString('hex'), path: upload.path };
+    for (const member of room.users.values()) { member.ready = false; member.buffering = false; }
+    room.state.desired = false; room.state.playing = false;
+    revise(room, 0); publishUsers(room);
+    io.to(channel(room.id)).emit('state', snapshot(room));
+    res.json({ ok: true });
+  } catch (error) {
+    releaseUpload(upload);
+    await fsp.rm(upload.path, { force: true }).catch(() => {});
+    if (!res.headersSent && !res.destroyed) res.status(400).json({ error: 'Upload failed. Select a valid MP4 and try again.' });
+  }
+});
+// Unpredictable per-video capability URLs. Express handles Range/HEAD/206/416,
+// enabling timeline scrubbing without downloading the entire movie first.
+app.get('/media/:roomId/:key', (req, res) => {
+  const media = rooms.get(req.params.roomId)?.media;
+  if (!media || req.params.key !== media.key) return res.sendStatus(404);
+  res.setHeader('Cache-Control', 'private, no-store');
+  res.setHeader('Content-Type', 'video/mp4');
+  res.sendFile(media.path, { acceptRanges: true }, error => {
+    if (error && !res.headersSent) res.status(error.statusCode || 500).end();
+  });
+});
+server.requestTimeout = 0; // Large uploads use an inactivity timeout instead.
+server.listen(process.env.PORT || 3000, '0.0.0.0', () => console.log('Watch Together upload server ready'));
+// Rooms and uploads disappear on Render restarts. No persistent disk required.
+process.on('SIGTERM', () => { io.close(); server.close(() => {
+  fs.rmSync(uploadDir, { recursive: true, force: true }); process.exit(0);
+}); });

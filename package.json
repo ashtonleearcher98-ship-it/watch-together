@@ -1,9 +1,16 @@
 {
-  "name": "watch-together-local",
-  "version": "1.0.0",
+  "name": "watch-together-upload",
+  "version": "2.0.0",
   "private": true,
-  "description": "Local MP4 watch parties with signaling only; no media uploads.",
-  "engines": { "node": ">=22" },
-  "scripts": { "start": "node server.js" },
-  "dependencies": { "express": "^4.21.2", "socket.io": "^4.8.1" }
+  "description": "Upload once and watch together using temporary MP4 hosting.",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "socket.io": "^4.8.1"
+  }
 }

@@ -29,14 +29,14 @@
     <section id="lobby" class="max-w-xl mx-auto py-12 lg:py-20">
       <p class="text-violet-400 text-sm font-semibold tracking-widest uppercase mb-4">Different houses. Same movie.</p>
       <h1 class="text-4xl lg:text-5xl font-bold tracking-tight mb-5">Your movie night,<br>together.</h1>
-      <p class="text-zinc-400 leading-relaxed mb-8">Select your own copy of the same MP4. We keep playback in sync while you chat. Your video stays on your device.</p>
+      <p class="text-zinc-400 leading-relaxed mb-8">Upload an MP4, invite your friends, and watch together. One upload. Everyone gets the same video, synced playback and room chat.</p>
       <div class="rounded-2xl border border-zinc-800 bg-zinc-900 p-6 space-y-5">
         <label class="block text-sm">Your display name<input id="name" class="field mt-2" maxlength="32" placeholder="Your name" autocomplete="nickname"></label>
         <button id="create" class="primary w-full" disabled>Create Room</button>
         <div class="flex items-center gap-3 text-xs text-zinc-500"><hr class="flex-1 border-zinc-700">OR JOIN A FRIEND<hr class="flex-1 border-zinc-700"></div>
         <form id="joinForm" class="flex gap-2"><input id="roomInput" aria-label="Room ID" class="field min-w-0 uppercase" maxlength="18" placeholder="Room ID" required><button id="join" class="secondary" disabled>Join</button></form>
       </div>
-      <p class="text-xs text-zinc-500 mt-6">No ads. No app session timer. Each person needs the same file and a browser that supports its video and audio codecs.</p>
+      <p class="text-xs text-zinc-500 mt-6">No ads. No app session timer. Temporary uploads up to 1 GiB. Videos disappear when the room closes or the server restarts.</p>
     </section>
     <section id="room" hidden>
       <div class="flex items-center justify-between gap-4 mb-6"><div><h1 class="text-xl font-semibold">Movie room <span id="roomCode" class="text-violet-400 font-mono text-sm"></span></h1><p id="role" class="text-sm text-zinc-400 mt-1"></p></div><button id="leave" class="secondary">Leave room</button></div>
@@ -44,12 +44,12 @@
         <section class="min-w-0">
           <div id="canvas" class="rounded-2xl overflow-hidden border border-zinc-800 bg-black">
             <div id="screen" class="relative aspect-video">
-              <!-- Object URLs reference local bytes. This element never points at the server. -->
+              <!-- All participants play the same temporary, range-enabled server video. -->
               <video id="video" class="w-full h-full object-contain" playsinline preload="auto" disablepictureinpicture></video>
               <button id="drop" class="absolute inset-0 flex flex-col items-center justify-center gap-4 bg-zinc-950 text-center p-5">
                 <span class="rounded-2xl bg-violet-500/10 text-violet-400 text-4xl p-5">＋</span>
-                <span class="font-semibold text-lg">Drag &amp; Drop or Click to Select MP4 File</span>
-                <span class="text-sm text-zinc-500">Local playback · Nothing uploaded</span>
+                <span class="font-semibold text-lg">Drag &amp; Drop or Click to Upload MP4 File</span>
+                <span class="text-sm text-zinc-500">Host uploads once · Friends watch here</span>
               </button>
               <button id="unlock" hidden class="absolute inset-0 bg-black/75 flex items-center justify-center"><span class="primary">Click to enable playback</span></button>
             </div>
@@ -61,9 +61,9 @@
               </div>
             </div>
           </div>
-          <div class="flex items-center justify-between gap-3 mt-4"><p id="filename" class="text-sm text-zinc-400 truncate">No video selected</p><button id="change" class="secondary text-sm shrink-0">Select file</button></div>
+          <div class="flex items-center justify-between gap-3 mt-4"><p id="filename" class="text-sm text-zinc-400 truncate">No video selected</p><button id="change" class="secondary text-sm shrink-0">Upload video</button></div>
           <p id="playbackStatus" class="text-sm text-violet-300 mt-4" role="status">Waiting for the host to choose a video.</p>
-          <p class="text-xs text-zinc-500 mt-3">The host controls play, pause and seeking. Playback waits while someone loads or buffers. Volume is personal.</p>
+          <p class="text-xs text-zinc-500 mt-3">The host uploads and controls play, pause and seeking. Friends only need the invite link. Playback waits during buffering.</p>
           <input id="file" hidden type="file" accept=".mp4,video/mp4">
         </section>
         <aside class="rounded-2xl border border-zinc-800 bg-zinc-900 flex flex-col h-[640px] max-h-[85vh]">
@@ -85,7 +85,7 @@
   const $ = id => document.getElementById(id);
   const video = $('video');
   let roomId = '', hostId = '', state = null, localMedia = null, objectURL = null;
-  let myReady = false, buffering = false, clockOffset = 0, bestRTT = Infinity;
+  let myReady = false, buffering = false, clockOffset = 0, bestRTT = Infinity, sharedKey = '', uploadXHR = null;
   let scrubbing = false, loadingFile = false, loadGeneration = 0, playbackAttempt = 0, needsUnlock = false;
   const seenMessages = new Set();
   const isHost = () => socket.id === hostId;
@@ -111,14 +111,14 @@
     const enabled = Boolean(roomId && socket.connected && isHost() && myReady && localMedia);
     $('play').disabled = $('seek').disabled = !enabled;
     $('send').disabled = !socket.connected;
+    $('change').disabled = !isHost() || !socket.connected || loadingFile;
     $('role').textContent = isHost() ? 'You are the host · You control playback' : 'The host controls playback';
     $('play').textContent = state?.desired ? 'Pause' : 'Play';
   }
   function status() {
     let text = 'Waiting for the host to choose a video.';
     if (state?.media) {
-      if (!localMedia) text = `Select your local copy of “${state.media.name}”.`;
-      else if (!myReady) text = 'File does not match the host’s size/duration. Select the same MP4.';
+      if (!localMedia || !myReady) text = `Loading shared video: “${state.media.name}”…`;
       else if (!socket.connected) text = 'Connection lost. Playback paused while reconnecting.';
       else if (state.blocked) text = 'Waiting for everyone to load their file or finish buffering…';
       else text = state.playing ? 'Playing together · Synced' : 'Paused · Synced';
@@ -152,7 +152,7 @@
   function acceptState(next, force = false) {
     if (!next || (state && next.revision < state.revision)) return;
     state = next; hostId = next.hostId;
-    myReady = Boolean(localMedia && next.media && localMedia.size === next.media.size && Math.abs(localMedia.duration-next.media.duration) < 0.25);
+    if (next.media && next.media.key !== sharedKey) { loadShared(next.media); return; }
     status(); applyPlayback(force);
   }
   function appendMessage(message) {
@@ -178,8 +178,8 @@
       const url = new URL(location.href); url.searchParams.set('room', roomId); history.replaceState(null, '', url);
       $('messages').replaceChildren(); seenMessages.clear(); result.chat.forEach(appendMessage);
       acceptState(result.state, true); notice('');
-      if (localMedia) {
-        await request('media', localMedia); buffering = false;
+      if (localMedia && localMedia.key === state?.media?.key && myReady) {
+        await request('ready', { key: sharedKey, ready: true }); buffering = false;
         if (video.readyState < 3) reportBuffer(true);
       }
     } catch (e) {
@@ -188,7 +188,7 @@
     } finally { $('create').disabled = $('join').disabled = !socket.connected; }
   }
   function resetRoom() {
-    roomId = ''; hostId = ''; state = null; myReady = false; video.pause();
+    uploadXHR?.abort(); roomId = ''; hostId = ''; state = null; myReady = false; sharedKey = ''; localMedia = null; video.pause(); video.removeAttribute('src'); video.load(); $('drop').hidden = false;
     $('lobby').hidden = false; $('room').hidden = true; $('unlock').hidden = true;
     const url = new URL(location.href); url.searchParams.delete('room'); history.replaceState(null, '', url);
   }
@@ -205,7 +205,7 @@
     if (roomId) await enter(false, true);
     controls();
   });
-  socket.on('disconnect', () => { video.pause(); $('connection').textContent = '● Reconnecting…'; $('create').disabled = $('join').disabled = true; status(); });
+  socket.on('disconnect', () => { uploadXHR?.abort(); video.pause(); $('connection').textContent = '● Reconnecting…'; $('create').disabled = $('join').disabled = true; status(); });
   socket.on('connect_error', () => { $('connection').textContent = 'Unable to connect · Retrying…'; });
   socket.on('state', next => acceptState(next, true));
   socket.on('chat', appendMessage);
@@ -266,42 +266,70 @@
   video.addEventListener('playing', () => reportBuffer(false));
   video.addEventListener('error', () => {
     if (loadingFile) return;
-    localMedia = null; myReady = false; video.pause(); $('drop').hidden = false;
-    if(socket.connected && roomId) request('media', null).catch(e => notice(e.message));
+    myReady = false; video.pause();
+    if(socket.connected && roomId && sharedKey) request('ready', { key: sharedKey, ready: false }).catch(e => notice(e.message));
     notice('This MP4 could not be decoded. Try a browser-compatible H.264/AAC MP4.'); controls();
   });
-  // File selection uses a local blob URL. Neither file bytes nor paths leave the browser.
-  async function loadFile(file) {
-    if (!file || !/\.mp4$/i.test(file.name)) return notice('Please select an MP4 file.');
-    if (!roomId || !socket.connected) return notice('Join a connected room before selecting a file.');
-    const generation = ++loadGeneration;
-    loadingFile = true; needsUnlock = false; $('unlock').hidden = true; localMedia = null; myReady = false; buffering = false; video.pause(); controls();
+  // When a shared URL changes, EVERY participant loads it automatically.
+  async function loadShared(media) {
+    sharedKey = media.key; myReady = false; buffering = false; needsUnlock = false;
+    localMedia = media; video.pause(); $('unlock').hidden = true;
+    $('drop').hidden = true; $('filename').textContent = media.name;
+    controls(); status();
+    const key = media.key;
     try {
-      await request('media', null);
-      if (objectURL) URL.revokeObjectURL(objectURL);
-      objectURL = URL.createObjectURL(file);
-      // Install listeners BEFORE setting src; metadata can be loaded immediately.
-      await new Promise((resolve,reject) => {
+      await new Promise((resolve, reject) => {
+        const timer = setTimeout(() => finish(new Error('Video loading timed out. Refresh to retry.')), 45000);
+        const ok = () => finish(); const bad = () => finish(new Error('This MP4 cannot be played. Use H.264 video and AAC audio.'));
+        function finish(error) { clearTimeout(timer); video.removeEventListener('loadedmetadata', ok); video.removeEventListener('error', bad); error ? reject(error) : resolve(); }
+        video.addEventListener('loadedmetadata', ok); video.addEventListener('error', bad);
+        video.src = media.url; video.load();
+      });
+      if (sharedKey !== key || !roomId) return;
+      $('seek').max = video.duration; myReady = true;
+      await request('ready', { key, ready: true });
+      if (video.readyState < 3) reportBuffer(true);
+      applyPlayback(true); status();
+    } catch(e) { if (sharedKey === key) { myReady = false; notice(e.message); controls(); } }
+  }
+  // Only metadata inspection is local; the selected bytes are uploaded once.
+  async function loadFile(file) {
+    if (!isHost()) return notice('Only the host can upload a video.');
+    if (!file || !/\.mp4$/i.test(file.name)) return notice('Please select an MP4 file.');
+    if (file.size > 1024*1024*1024) return notice('Choose an MP4 no larger than 1 GiB.');
+    if (!roomId || !socket.connected) return notice('Join a connected room before uploading.');
+    loadingFile = true; controls();
+    const probe = document.createElement('video');
+    const url = URL.createObjectURL(file);
+    try {
+      const duration = await new Promise((resolve,reject) => {
         const timer = setTimeout(() => finish(new Error('Could not read video metadata.')), 15000);
         const ok = () => finish(); const bad = () => finish(new Error('Unsupported or damaged MP4.'));
-        function finish(error) { clearTimeout(timer); video.removeEventListener('loadedmetadata',ok); video.removeEventListener('error',bad); error ? reject(error) : resolve(); }
-        video.addEventListener('loadedmetadata',ok); video.addEventListener('error',bad);
-        video.src = objectURL; video.load();
+        function finish(error) { clearTimeout(timer); probe.onloadedmetadata = probe.onerror = null; error ? reject(error) : resolve(probe.duration); }
+        probe.onloadedmetadata = ok; probe.onerror = bad; probe.preload = 'metadata'; probe.src = url;
       });
-      if (generation !== loadGeneration) return;
-      if (!Number.isFinite(video.duration) || video.duration <= 0) throw new Error('This file has no valid duration.');
-      localMedia = { name:file.name, size:file.size, duration:video.duration };
-      $('filename').textContent = file.name; $('seek').max = video.duration; $('drop').hidden = true;
-      loadingFile = false;
-      const result = await request('media',localMedia); myReady = result.ready;
-      buffering = false;
-      if (video.readyState < 3) reportBuffer(true);
-      await applyPlayback(true); status(); notice('');
-    } catch(e) { localMedia = null; myReady = false; $('drop').hidden = false; notice(e.message); }
-    finally { loadingFile = false; $('file').value = ''; controls(); }
+      if (!Number.isFinite(duration) || duration <= 0) throw new Error('Invalid MP4 duration.');
+      const ticket = await request('upload-start', { name: file.name, size: file.size, duration });
+      notice('Uploading video… 0%');
+      await new Promise((resolve,reject) => {
+        const xhr = new XMLHttpRequest(); uploadXHR = xhr;
+        xhr.open('PUT', ticket.url); xhr.setRequestHeader('Content-Type','video/mp4');
+        xhr.upload.onprogress = e => { if (e.lengthComputable) notice(`Uploading video… ${Math.round(e.loaded/e.total*100)}%`); };
+        xhr.onload = () => {
+          uploadXHR = null;
+          if (xhr.status >= 200 && xhr.status < 300) resolve();
+          else { let message = 'Upload failed. Please try again.'; try { message = JSON.parse(xhr.responseText).error || message; } catch {} reject(new Error(message)); }
+        };
+        xhr.onerror = () => { uploadXHR = null; reject(new Error('Upload failed: connection lost.')); };
+        xhr.onabort = () => { uploadXHR = null; reject(new Error('Upload cancelled.')); };
+        xhr.send(file);
+      });
+      notice('Upload complete. Everyone in the room can watch now.');
+    } catch(e) { notice(e.message); }
+    finally { probe.removeAttribute('src'); probe.load(); URL.revokeObjectURL(url); loadingFile = false; $('file').value = ''; controls(); applyPlayback(true); }
   }
   $('file').onchange = () => loadFile($('file').files[0]);
-  $('drop').onclick = $('change').onclick = () => { if (!loadingFile) $('file').click(); };
+  $('drop').onclick = $('change').onclick = () => { if (!isHost()) notice('Waiting for the host to upload a video.'); else if (!loadingFile) $('file').click(); };
   $('screen').addEventListener('dragover', event => { event.preventDefault(); });
   $('screen').addEventListener('drop', event => { event.preventDefault(); if (!loadingFile) loadFile(event.dataTransfer.files[0]); });
   // Resync every 3 seconds while a party is open. No background requests without a room.
